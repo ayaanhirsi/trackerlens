@@ -1,155 +1,75 @@
-# trackerlens
+# TrackerLens
 
-A small, dependency-free Python tool that reads a browser **HAR capture** and reports the
-third-party tracking signals in it: who the page talks to, which cookies third parties set,
-whether link-decoration parameters are present, and whether the same identifier is being
-passed between different third-party domains (a sign of cookie/ID syncing).
+A small Python tool that reads browser HAR captures and measures third-party tracking: how many requests, domains and cookies come from outside the site you visited. Capture a page twice, once normally and once with an ad blocker, and TrackerLens shows what the blocker removed.
 
-It also compares two captures of the same site, so you can measure how much tracking a
-browser setting, content blocker, or privacy feature removes.
+This is a proof of concept, demonstrated on two sites.
 
-## Why
+## Demo results
 
-Web tracking research starts with measurement. DevTools shows every request, but not the
-patterns across them. `trackerlens` turns one HAR export into a short, scriptable report
-and a JSON file you can diff in CI.
+I captured BBC and CNN twice each: a baseline run with no blocking, and a run with uBlock Origin enabled.
 
-## What it detects
+| Site | Requests (base → blocked) | Third-party requests | Third-party domains | Third-party cookies |
+|------|---------------------------|----------------------|---------------------|---------------------|
+| bbc.com | 213 → 108 | 112 → 14 (**-87.5%**) | 24 → 9 | 14 → 2 |
+| cnn.com | 426 → 171 | 327 → 52 (**-84.1%**) | 58 → 14 | 53 → 6 |
+| **Total** | | 439 → 66 | 82 → 23 | 67 → 8 |
 
-| Signal | How |
-| --- | --- |
-| Third-party requests | Registrable domain (eTLD+1) differs from the visited site |
-| Known trackers | Hostname matches a tracker list (small built-in list, or your own via `--blocklist`) |
-| Third-party cookies | `Set-Cookie` on third-party responses, with `SameSite`, `Secure`, and session vs. persistent |
-| Link decoration | Query parameters such as `utm_*`, `fbclid`, `gclid`, `msclkid` on any request |
-| Cross-domain ID sync | An identifier-looking value (query param or cookie value) seen by 2+ third-party domains |
-| Third-party redirects | 3xx responses from a third party that send the browser to a different domain |
-| Bounce tracking | A redirect chain that passes through a domain different from both its origin and destination, scored on cookies set, forwarded identifiers, tracker-list match, and how often it recurs (see below) |
+On these two sites, the blocker cut third-party requests by 84-88%. Two sites is a demonstration of the pipeline, not a general finding about the web. The raw HAR files are not included, since they contain full request headers, so these numbers can't be reproduced without capturing your own.
 
-## Install and run
+What the blocker left behind is telling. On BBC, the only third-party cookies remaining in the blocked run came from `piano.io` and `tinypass.com`, a paywall and subscription service. In the baseline, cookies were set by ad and measurement hosts such as doubleclick, scorecardresearch, permutive and cxense.
 
-```bash
-git clone https://github.com/ayaanhirsi/trackerlens
-cd trackerlens
-pip install -e .          # Python 3.9+, no runtime dependencies
+## How it works
 
-trackerlens analyze examples/sample.har
-trackerlens analyze site.har --first-party example.com --json
-trackerlens analyze examples/bounce.har     # bounce-tracking demo
-trackerlens analyze site.har --blocklist my-trackers.txt --max-trackers 3   # exit 1 if exceeded
-trackerlens compare before.har after.har
+1. Export a HAR file from your browser's DevTools (Network tab, "Save all as HAR").
+2. Name it after the site, with no `www.`: `bbc.com.har`, `cnn.com.har`.
+3. Put baseline captures in one folder and blocked captures in another, using the same filename in both.
+4. Run the batch script, which pairs files by name and writes a CSV.
+
+```bat
+python examples\batch_summary.py baseline blocked results.csv
 ```
 
-You can also run it without installing: `python -m trackerlens analyze examples/sample.har`.
+The script prints headline numbers (median and mean drop in third-party requests, plus totals for domains and cookies) and writes one row per site to `results.csv`.
 
-## Bounce tracking
+You can also use the library directly:
 
-Bounce (or redirect) tracking sends you through a tracker's domain for an instant during
-navigation, so the tracker runs as a *first party*: it can read and write its own cookies
-and tag the destination URL with an ID, which sidesteps third-party cookie blocking.
+```python
+from trackerlens import analyze, load_har
 
-```
-news.example -> track.adtech.example (302) -> shop.example/landing?clid=a1b2…3a
-```
-
-How `trackerlens` finds it:
-
-1. Link each 3xx response to the later request whose URL matches its `Location` (or
-   `redirectURL`), forming redirect chains. A link click is not a redirect, so the page
-   that started the chain is taken from the first request's `Referer`.
-2. In each chain, any hop on a registrable domain different from **both** the origin and
-   the final destination is a *candidate*.
-3. Score each candidate:
-
-| Signal | Score |
-| --- | --- |
-| Sets a cookie during the hop | +2 |
-| Adds an identifier-looking or tracking query parameter to the next URL | +2 |
-| Hostname is on the tracker list | +2 |
-| Appears in 2+ chains in the capture (a hub) | +1 |
-
-A candidate is reported as **suspected** when its score is at least 3 *and* it sets a cookie
-or forwards a parameter. Everything else is listed as a plain candidate. Candidates and
-scores are also in the `--json` output under `bounces`, and `compare` includes a
-`bounce_trackers` count of distinct suspected domains.
-
-```
-Redirect-chain hops (possible bounce tracking):
-  [suspected, score 5] adtech.example
-    news.example -> track.adtech.example (302) -> shop.example
-    signals: cookie set: bt_uid; forwarded: clid=a1b2…3a; seen in 2 chains
-  [candidate, score 2] provider.example
-    news.example (302) -> sso.provider.example (302) -> sso.provider.example (302) -> news.example
-    signals: cookie set: sid
+report = analyze(
+    load_har("baseline/bbc.com.har"),
+    first_party="bbc.com",
+    also_first_party=["bbc.co.uk", "bbci.co.uk", "bbc.net.uk"],
+)
+print(report.third_party_requests, len(report.third_party_domains))
 ```
 
-`examples/bounce.har` is synthetic (generate it with
-`python examples/make_sample_har.py examples/bounce.har bounce`). It includes a bounce
-tracker, a normal SSO login, and a link shortener, to show how the scoring separates them.
+## Method
 
-### Capture a real HAR
-
-1. Open the site in a fresh/private window with DevTools → Network open ("Preserve log" on).
-2. Load the page and interact normally for a minute.
-3. Export: Network → "Save all as HAR".
-4. Repeat in a second browser or with a setting changed, then `trackerlens compare a.har b.har`.
-
-### Example output
-
-`examples/sample.har` is **synthetic** (generated by `examples/make_sample_har.py`, using
-reserved `.example` domains). It exists for demos and tests, not as a measurement of any
-real website.
-
-```
-trackerlens report for news.example
-================================================
-Requests:              10
-Third-party requests:  6 (60%)
-Third-party domains:   6
-Known tracker domains: 5
-Third-party cookies:   2
-Cross-domain ID syncs: 1
-Tracking-param reqs:   1
-...
-Identifier shared across third-party domains (possible ID sync):
-  value a1b2…3a seen by: adnxs.com, criteo.com, google-analytics.com
-```
-
-## Tests
-
-```bash
-python -m unittest discover -s tests -v      # or: pytest
-```
+- **Site name** comes from the filename (`cnn.com.har` means the site is `cnn.com`).
+- **First-party aliases.** Sites serve their own content from other domains (BBC uses `bbci.co.uk` for images and static files). Without handling this, those requests would be miscounted as third-party. The alias table is `FIRST_PARTY_ALIASES` at the top of `examples/batch_summary.py`. For these runs I used:
+  - `bbc.com`: `bbc.co.uk`, `bbci.co.uk`, `bbc.net.uk`
+  - `cnn.com`: `cnn.io`
+- **Blocked entries are excluded.** HAR entries with a response status of 0 never got a response, which is how Chrome records a blocked request. They are dropped from all counts (requests, domains, cookies, bounces). The number dropped is reported in the `failed_entries_base` and `failed_entries_blocked` CSV columns. In a baseline run this should be near zero; a large value suggests a bad capture.
 
 ## Limitations
 
-- **Heuristics, not proof.** An ID "sync" means one identifier-looking value reached several
-  third-party domains in this capture. It is a strong hint, not a confirmed tracking flow.
-- **eTLD+1 is approximate.** A small built-in suffix list is used instead of the full Public
-  Suffix List, so rare suffixes may be misclassified.
-- **Tiny tracker list.** The built-in list is illustrative. Use `--blocklist` with a real list
-  for serious analysis.
-- **HAR only.** It sees what the browser exports: no JavaScript fingerprinting detection, no
-  CNAME-cloaking resolution, no storage (localStorage/IndexedDB) analysis.
-- Cookies are read from `Set-Cookie` response headers only.
-- **Bounce tracking is HTTP-only.** Client-side bounces (JavaScript `location` changes,
-  `<meta http-equiv="refresh">`) never appear as 3xx responses, so they are not detected.
-- **Bounce candidates can be legitimate.** Login/SSO flows, payment redirects, and link
-  shorteners have the same shape as a bounce tracker. The cookie and forwarded-parameter
-  requirement reduces false alarms, but an SSO flow that forwards a long auth code will
-  still be flagged. Treat `suspected` as "worth a look".
-- **One capture is weak evidence.** Browsers that defend against bounce tracking (such as
-  Safari) judge a domain by seeing it redirect many different users over time. `trackerlens`
-  only sees one session, so the "hub" signal is limited to repetition within a capture.
+- **Cookie counts are a lower bound.** The tool only sees `Set-Cookie` response headers. Cookies set by JavaScript (`document.cookie`) never appear in a HAR. This is probably why BBC shows no first-party cookies at all.
+- **The alias list is a manual judgment** about which domains a site owns, and it may be incomplete. Unlisted first-party hosts would be counted as third-party and inflate the baseline.
+- **`bbc.com` and `bbc.co.uk` are different sites.** These results are for `bbc.com`.
+- **Small sample.** Two sites, one capture each, so there is no variance estimate. Page content, ads and A/B tests change between loads.
+- **Request counts depend on the capture.** How long the page was left open and how far it was scrolled affect what loads.
 
-## Roadmap
+## Tests
 
-- Merge several captures to measure bounce hubs across sessions
-- Detect client-side (JavaScript / meta-refresh) bounces
-- CNAME-cloaking detection via DNS lookups
-- Load Disconnect / EasyPrivacy list formats directly
-- Optional full Public Suffix List support
+```bat
+python -m unittest discover tests
+```
 
-## License
+## Project layout
 
-MIT
+```
+trackerlens/    analysis library (analyzer.py, HAR loading)
+examples/       batch_summary.py, the HAR pair to CSV script
+tests/          unit tests
+```
