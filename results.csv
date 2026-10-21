@@ -1,0 +1,3 @@
+site,file,requests_base,requests_blocked,failed_entries_base,failed_entries_blocked,tp_requests_base,tp_requests_blocked,tp_domains_base,tp_domains_blocked,tp_cookies_base,tp_cookies_blocked,tp_request_drop_pct,bounces_base
+bbc.com,bbc.com.har,213,108,0,17,112,14,24,9,14,2,87.5,0
+cnn.com,cnn.com.har,426,171,6,36,327,52,58,14,53,6,84.09785932721712,3
