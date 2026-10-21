@@ -85,6 +85,7 @@ class Cookie:
 class Report:
     first_party: str
     total_requests: int = 0
+    blocked_requests: int = 0  # entries with no real response (status 0), excluded from all counts
     third_party_requests: int = 0
     third_party_domains: dict[str, int] = field(default_factory=dict)
     tracker_domains: dict[str, int] = field(default_factory=dict)
@@ -239,10 +240,22 @@ def analyze(
     har: dict[str, Any],
     first_party: str | None = None,
     blocklist: Iterable[str] | None = None,
+    also_first_party: Iterable[str] | None = None,
 ) -> Report:
-    """Analyze a parsed HAR dict and return a :class:`Report`."""
+    """Analyze a parsed HAR dict and return a :class:`Report`.
+
+    ``also_first_party`` lists extra registrable domains owned by the visited
+    site (e.g. bbci.co.uk for bbc.com) so they are not counted as third-party.
+    Entries whose response status is 0 (blocked or failed requests, as Chrome
+    records for ad-blocked URLs) are excluded from every count.
+    """
     blocklist = frozenset(blocklist) if blocklist is not None else TRACKER_DOMAINS
-    entries = har["log"]["entries"]
+    all_entries = har["log"]["entries"]
+    entries = [
+        e for e in all_entries
+        if not ("status" in e.get("response", {}) and int(e["response"].get("status") or 0) == 0)
+    ]
+    n_dropped = len(all_entries) - len(entries)
 
     if first_party is None:
         first_url = next((e["request"]["url"] for e in entries if "request" in e), "")
@@ -250,7 +263,11 @@ def analyze(
     else:
         first_party = registrable_domain(first_party.lower())
 
+    first_party_set = {first_party} | {
+        registrable_domain(d.lower()) for d in (also_first_party or [])
+    }
     report = Report(first_party=first_party)
+    report.blocked_requests = n_dropped
     third_hosts: Counter[str] = Counter()
     trackers: Counter[str] = Counter()
     seen_cookies: set[tuple[str, str]] = set()
@@ -266,7 +283,7 @@ def analyze(
             continue
         report.total_requests += 1
         reg = registrable_domain(host)
-        third_party = reg != first_party
+        third_party = reg not in first_party_set
 
         query = parse_qsl(parts.query, keep_blank_values=True)
 
